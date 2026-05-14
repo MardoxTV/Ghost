@@ -41,6 +41,7 @@ apt-get update -qq
 info "Installing system dependencies..."
 PACKAGES=(
     "tor"
+    "proxychains4"
     "iptables"
     "iproute2"
     "net-tools"

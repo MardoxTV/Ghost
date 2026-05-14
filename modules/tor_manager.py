@@ -44,29 +44,26 @@ def get_tor_uid() -> str:
 
 
 def _configure_torrc():
-    """Deploy ghost torrc settings."""
+    """Always overwrite system torrc with Ghost config."""
     with open(TORRC_PATH, "r") as f:
         ghost_config = f.read()
+    with open(SYSTEM_TORRC, "w") as f:
+        f.write(ghost_config)
 
-    # Append to system torrc if not already configured
-    try:
-        with open(SYSTEM_TORRC, "r") as f:
-            current = f.read()
-        if "VirtualAddrNetwork 10.192.0.0/10" not in current:
-            with open(SYSTEM_TORRC, "w") as f:
-                f.write(ghost_config)
-    except FileNotFoundError:
-        with open(SYSTEM_TORRC, "w") as f:
-            f.write(ghost_config)
+
+def _tor_port_listening(port: str) -> bool:
+    """Return True if Tor is listening on the given port (UDP or TCP)."""
+    result = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True)
+    result_udp = subprocess.run(["ss", "-ulnp"], capture_output=True, text=True)
+    return f":{port}" in result.stdout or f":{port}" in result_udp.stdout
 
 
 def _tor_dns_listening() -> bool:
-    """Return True if Tor is actually listening on port 9053."""
-    result = subprocess.run(
-        ["ss", "-ulnp"],
-        capture_output=True, text=True
-    )
-    return ":9053" in result.stdout
+    return _tor_port_listening("9053")
+
+
+def _tor_socks_listening() -> bool:
+    return _tor_port_listening("9050")
 
 
 def _disable_systemd_resolved():
@@ -95,23 +92,26 @@ def start_tor() -> tuple[bool, str]:
 
     _configure_torrc()
 
+    # Always restart so the new torrc (with SocksPort) takes full effect
+    _run(["service", "tor", "stop"], check=False)
+    time.sleep(1)
+    result = _run(["service", "tor", "start"], check=False)
+    time.sleep(3)
     if not is_tor_running():
-        result = _run(["service", "tor", "start"], check=False)
-        time.sleep(3)
-        if not is_tor_running():
-            return False, f"Failed to start Tor: {result.stderr}"
-    else:
-        # Reload config so new torrc takes effect
-        _run(["service", "tor", "reload"], check=False)
-        time.sleep(2)
+        return False, f"Failed to start Tor: {result.stderr}"
 
-    # Wait up to 10s for DNS port to come up
+    # Wait up to 10s for both SOCKS and DNS ports to come up
     for _ in range(10):
-        if _tor_dns_listening():
-            return True, "Tor service started (DNS port 9053 ready)"
+        if _tor_dns_listening() and _tor_socks_listening():
+            return True, "Tor service started (SOCKS5 :9050 and DNS :9053 ready)"
         time.sleep(1)
 
-    return False, "Tor started but DNS port 9053 is not listening — check /etc/tor/torrc"
+    missing = []
+    if not _tor_socks_listening():
+        missing.append("SOCKS5 :9050")
+    if not _tor_dns_listening():
+        missing.append("DNS :9053")
+    return False, f"Tor started but not listening on: {', '.join(missing)} — check /etc/tor/torrc"
 
 
 def stop_tor() -> tuple[bool, str]:
@@ -169,10 +169,10 @@ def enable_routing() -> tuple[bool, str]:
         # ── Write resolv.conf pointing to Tor's local DNS ────────────────────
         _write_resolv_conf()
 
-        # ── Configure Firefox to use Tor SOCKS5 + disable DoH ────────────────
+        # ── Configure proxychains + Firefox prefs ────────────────────────────
         from modules import browser as _browser
         _browser.kill_firefox()
-        _browser.configure_firefox(restore=False)
+        _browser.apply_all(restore=False)
 
         return True, "All traffic routed through Tor (DNS port 53 → 9053)"
 
@@ -186,10 +186,10 @@ def disable_routing() -> tuple[bool, str]:
         _flush_chains()
         _restore_resolv_conf()
         _enable_systemd_resolved()
-        # Restore Firefox to original settings
+        # Restore proxychains + Firefox to original settings
         from modules import browser as _browser
         _browser.kill_firefox()
-        _browser.configure_firefox(restore=True)
+        _browser.apply_all(restore=True)
         return True, "Tor routing disabled, traffic restored"
     except Exception as e:
         return False, str(e)

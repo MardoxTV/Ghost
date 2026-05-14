@@ -404,29 +404,39 @@ def menu_cleaner():
 
 def menu_browser():
     console.rule("[bold red]  BROWSER ANONYMIZATION", style="red")
-    ff_running = browser.is_firefox_running()
-    console.print(f"\n  [dim]Firefox running:[/]  {'[bold yellow]Yes — will be restarted[/]' if ff_running else '[dim]No'}\n")
+    ff_running  = browser.is_firefox_running()
+    pc_ok       = browser.is_proxychains_installed()
+    console.print(f"\n  [dim]Firefox       :[/]  {'[bold yellow]Running[/]' if ff_running else '[dim]Not running'}")
+    console.print(f"  [dim]proxychains   :[/]  {'[bold green]Installed[/]' if pc_ok else '[bold red]NOT installed — run: apt install proxychains4[/]'}\n")
 
-    console.print("    [bold cyan]1.[/]  Configure Firefox → Tor SOCKS5 + disable DoH  [bold green](recommended)[/]")
-    console.print("    [bold cyan]2.[/]  Restore Firefox original settings")
-    console.print("    [bold cyan]3.[/]  Launch Firefox (Tor-routed)")
-    console.print("    [bold cyan]4.[/]  Launch Tor Browser")
-    console.print("    [bold cyan]5.[/]  Show Chromium Tor launch command")
+    console.print("    [bold cyan]1.[/]  Launch Firefox via proxychains  [bold green](recommended — syscall-level, bypasses DoH)[/]")
+    console.print("    [bold cyan]2.[/]  Launch Tor Browser")
+    console.print("    [bold cyan]3.[/]  Configure Firefox prefs → SOCKS5 + disable DoH")
+    console.print("    [bold cyan]4.[/]  Restore Firefox original prefs")
+    console.print("    [bold cyan]5.[/]  Show Chromium proxychains command")
     console.print("    [bold cyan]0.[/]  Back\n")
 
     choice = Prompt.ask("  Select", default="0")
 
     if choice == "1":
         browser.kill_firefox()
-        results = browser.configure_firefox(restore=False)
-        if results:
-            for profile, ok in results.items():
-                (print_ok if ok else print_fail)(f"{'Configured' if ok else 'Failed'}: {profile}")
-            print_info("Reopen Firefox — it will now use Tor SOCKS5 with no DoH")
-        else:
-            print_warn("No Firefox profiles found. Firefox may not be installed.")
+        ok, msg = browser.launch_firefox_proxychains()
+        (print_ok if ok else print_fail)(msg)
+        if not ok and not pc_ok:
+            print_warn("Install proxychains4 first:  sudo apt install proxychains4")
 
     elif choice == "2":
+        ok, msg = browser.launch_tor_browser()
+        (print_ok if ok else print_fail)(msg)
+
+    elif choice == "3":
+        browser.kill_firefox()
+        results = browser.configure_firefox(restore=False)
+        for loc, ok in results.items():
+            (print_ok if ok else print_fail)(f"{'OK' if ok else 'FAIL'}: {loc}")
+        print_info("Reopen Firefox — proxy locked to Tor SOCKS5")
+
+    elif choice == "4":
         browser.kill_firefox()
         results = browser.configure_firefox(restore=True)
         if any(results.values()):
@@ -434,17 +444,10 @@ def menu_browser():
         else:
             print_warn("No backup found — nothing to restore")
 
-    elif choice == "3":
-        ok = browser.launch_firefox_tor()
-        (print_ok if ok else print_fail)("Firefox launched" if ok else "Firefox not found")
-
-    elif choice == "4":
-        ok = browser.launch_tor_browser()
-        (print_ok if ok else print_fail)("Tor Browser launched" if ok else "Tor Browser not found — install it first")
-
     elif choice == "5":
         cmd = browser.get_chromium_command()
         console.print(f"\n  [bold white]{cmd}[/]\n")
+        print_info("Copy and run that command to open Chromium through Tor")
 
     console.print()
 

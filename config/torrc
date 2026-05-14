@@ -1,5 +1,5 @@
 VirtualAddrNetwork 10.192.0.0/10
 AutomapHostsOnResolve 1
-TransPort 9040
-DNSPort 9053
-ControlPort 9051
+TransPort 127.0.0.1:9040
+DNSPort 127.0.0.1:9053
+ControlPort 127.0.0.1:9051

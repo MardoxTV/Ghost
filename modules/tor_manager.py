@@ -60,6 +60,35 @@ def _configure_torrc():
             f.write(ghost_config)
 
 
+def _tor_dns_listening() -> bool:
+    """Return True if Tor is actually listening on port 9053."""
+    result = subprocess.run(
+        ["ss", "-ulnp"],
+        capture_output=True, text=True
+    )
+    return ":9053" in result.stdout
+
+
+def _disable_systemd_resolved():
+    """Stop systemd-resolved and replace its symlink with a real resolv.conf."""
+    subprocess.run(["systemctl", "stop", "systemd-resolved"], check=False, capture_output=True)
+    subprocess.run(["systemctl", "disable", "systemd-resolved"], check=False, capture_output=True)
+    # resolv.conf is often a symlink managed by systemd-resolved — replace it
+    resolv = "/etc/resolv.conf"
+    if os.path.islink(resolv):
+        try:
+            os.remove(resolv)
+            with open(resolv, "w") as f:
+                f.write("# Ghost - placeholder\nnameserver 9.9.9.9\n")
+        except (IOError, PermissionError):
+            pass
+
+
+def _enable_systemd_resolved():
+    subprocess.run(["systemctl", "enable", "systemd-resolved"], check=False, capture_output=True)
+    subprocess.run(["systemctl", "start", "systemd-resolved"], check=False, capture_output=True)
+
+
 def start_tor() -> tuple[bool, str]:
     if not is_tor_installed():
         return False, "Tor is not installed. Run: apt install tor"
@@ -68,11 +97,21 @@ def start_tor() -> tuple[bool, str]:
 
     if not is_tor_running():
         result = _run(["service", "tor", "start"], check=False)
-        time.sleep(2)
+        time.sleep(3)
         if not is_tor_running():
             return False, f"Failed to start Tor: {result.stderr}"
+    else:
+        # Reload config so new torrc takes effect
+        _run(["service", "tor", "reload"], check=False)
+        time.sleep(2)
 
-    return True, "Tor service started"
+    # Wait up to 10s for DNS port to come up
+    for _ in range(10):
+        if _tor_dns_listening():
+            return True, "Tor service started (DNS port 9053 ready)"
+        time.sleep(1)
+
+    return False, "Tor started but DNS port 9053 is not listening — check /etc/tor/torrc"
 
 
 def stop_tor() -> tuple[bool, str]:
@@ -84,44 +123,53 @@ def enable_routing() -> tuple[bool, str]:
     """Enable all-traffic Tor routing via iptables."""
     tor_uid = get_tor_uid()
 
+    # Stop systemd-resolved so it cannot override resolv.conf
+    _disable_systemd_resolved()
+
     ok, msg = start_tor()
     if not ok:
         return False, msg
 
     try:
-        # Flush existing Ghost chains
+        # Flush any existing Ghost rules first
         _flush_chains()
 
-        # Create new nat chain
+        # ── PREROUTING: forward port 53 → 9053 for all incoming DNS ──────────
+        _run(["iptables", "-t", "nat", "-A", "PREROUTING",
+              "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT])
+        _run(["iptables", "-t", "nat", "-A", "PREROUTING",
+              "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT])
+
+        # ── OUTPUT: direct DNS rules at the top level (not in a sub-chain) ───
+        # Exclude Tor's own traffic from being re-routed
+        if tor_uid:
+            _run(["iptables", "-t", "nat", "-A", "OUTPUT",
+                  "-m", "owner", "--uid-owner", tor_uid, "-j", "RETURN"])
+
+        _run(["iptables", "-t", "nat", "-A", "OUTPUT",
+              "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT])
+        _run(["iptables", "-t", "nat", "-A", "OUTPUT",
+              "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT])
+
+        # ── GHOST_OUTPUT chain: TCP traffic through Tor transparent proxy ─────
         _run(["iptables", "-t", "nat", "-N", "GHOST_OUTPUT"], check=False)
 
-        # Exclude non-routable networks
         for net in NON_TOR_NETS:
             _run(["iptables", "-t", "nat", "-A", "GHOST_OUTPUT", "-d", net, "-j", "RETURN"])
 
-        # Redirect DNS to Tor's DNS resolver
-        _run(["iptables", "-t", "nat", "-A", "GHOST_OUTPUT",
-              "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT])
-
-        # Redirect all TCP to Tor transparent proxy
         _run(["iptables", "-t", "nat", "-A", "GHOST_OUTPUT",
               "-p", "tcp", "--syn", "-j", "REDIRECT", "--to-ports", TRANS_PORT])
 
-        # Apply chain to OUTPUT, excluding Tor's own traffic
         if tor_uid:
             _run(["iptables", "-t", "nat", "-A", "OUTPUT",
-                  "-m", "owner", "!", "--uid-owner", tor_uid, "-j", "GHOST_OUTPUT"])
+                  "-p", "tcp", "-m", "owner", "!", "--uid-owner", tor_uid, "-j", "GHOST_OUTPUT"])
         else:
-            _run(["iptables", "-t", "nat", "-A", "OUTPUT", "-j", "GHOST_OUTPUT"])
+            _run(["iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", "GHOST_OUTPUT"])
 
-        # Drop non-Tor outbound connections (prevent leaks)
-        _run(["iptables", "-N", "GHOST_DROP"], check=False)
-        _run(["iptables", "-A", "GHOST_DROP", "-j", "DROP"])
-
-        # Configure DNS resolver to use Tor
+        # ── Write resolv.conf pointing to Tor's local DNS ────────────────────
         _write_resolv_conf()
 
-        return True, "All traffic routed through Tor"
+        return True, "All traffic routed through Tor (DNS port 53 → 9053)"
 
     except subprocess.CalledProcessError as e:
         return False, f"iptables error: {e}"
@@ -132,16 +180,41 @@ def disable_routing() -> tuple[bool, str]:
     try:
         _flush_chains()
         _restore_resolv_conf()
+        _enable_systemd_resolved()
         return True, "Tor routing disabled, traffic restored"
     except Exception as e:
         return False, str(e)
 
 
 def _flush_chains():
-    """Remove Ghost iptables chains."""
-    _run(["iptables", "-t", "nat", "-D", "OUTPUT", "-j", "GHOST_OUTPUT"], check=False)
+    """Remove all Ghost iptables rules."""
+    # PREROUTING DNS forward rules
+    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
+          "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT], check=False)
+    _run(["iptables", "-t", "nat", "-D", "PREROUTING",
+          "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT], check=False)
+
+    # OUTPUT top-level DNS rules
+    _run(["iptables", "-t", "nat", "-D", "OUTPUT",
+          "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT], check=False)
+    _run(["iptables", "-t", "nat", "-D", "OUTPUT",
+          "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", DNS_PORT], check=False)
+
+    # Tor owner RETURN rule
+    tor_uid = get_tor_uid()
+    if tor_uid:
+        _run(["iptables", "-t", "nat", "-D", "OUTPUT",
+              "-m", "owner", "--uid-owner", tor_uid, "-j", "RETURN"], check=False)
+        _run(["iptables", "-t", "nat", "-D", "OUTPUT",
+              "-p", "tcp", "-m", "owner", "!", "--uid-owner", tor_uid, "-j", "GHOST_OUTPUT"], check=False)
+    else:
+        _run(["iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", "GHOST_OUTPUT"], check=False)
+
+    # GHOST_OUTPUT custom chain
     _run(["iptables", "-t", "nat", "-F", "GHOST_OUTPUT"], check=False)
     _run(["iptables", "-t", "nat", "-X", "GHOST_OUTPUT"], check=False)
+
+    # Legacy GHOST_DROP chain (kept for backwards compat)
     _run(["iptables", "-D", "OUTPUT", "-j", "GHOST_DROP"], check=False)
     _run(["iptables", "-F", "GHOST_DROP"], check=False)
     _run(["iptables", "-X", "GHOST_DROP"], check=False)

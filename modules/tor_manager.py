@@ -169,6 +169,11 @@ def enable_routing() -> tuple[bool, str]:
         # ── Write resolv.conf pointing to Tor's local DNS ────────────────────
         _write_resolv_conf()
 
+        # ── Configure Firefox to use Tor SOCKS5 + disable DoH ────────────────
+        from modules import browser as _browser
+        _browser.kill_firefox()
+        _browser.configure_firefox(restore=False)
+
         return True, "All traffic routed through Tor (DNS port 53 → 9053)"
 
     except subprocess.CalledProcessError as e:
@@ -181,6 +186,10 @@ def disable_routing() -> tuple[bool, str]:
         _flush_chains()
         _restore_resolv_conf()
         _enable_systemd_resolved()
+        # Restore Firefox to original settings
+        from modules import browser as _browser
+        _browser.kill_firefox()
+        _browser.configure_firefox(restore=True)
         return True, "Tor routing disabled, traffic restored"
     except Exception as e:
         return False, str(e)

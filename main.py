@@ -26,7 +26,7 @@ from rich.prompt import Prompt, Confirm
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.style import Style
 
-from modules import mac_changer, tor_manager, dns_manager, hostname_changer, cleaner, status
+from modules import mac_changer, tor_manager, dns_manager, hostname_changer, cleaner, status, browser
 
 console = Console()
 
@@ -392,12 +392,59 @@ def menu_cleaner():
             hist = sum(1 for v in results["shell_history"].values() if v)
             logs = sum(1 for v in results["system_logs"].values() if v)
             tmp = sum(results["temp_files"].values())
-            browser = sum(1 for v in results["browser_data"].values() if v)
+            browser_count = sum(1 for v in results["browser_data"].values() if v)
             print_ok(f"History files: {hist} cleared")
             print_ok(f"Log files: {logs} cleared")
             print_ok(f"Temp files: {tmp} removed")
-            print_ok(f"Browser data: {browser} location(s) cleared")
+            print_ok(f"Browser data: {browser_count} location(s) cleared")
             print_ok(f"Recent files: {'cleared' if results['recent_files'] else 'none found'}")
+
+    console.print()
+
+
+def menu_browser():
+    console.rule("[bold red]  BROWSER ANONYMIZATION", style="red")
+    ff_running = browser.is_firefox_running()
+    console.print(f"\n  [dim]Firefox running:[/]  {'[bold yellow]Yes — will be restarted[/]' if ff_running else '[dim]No'}\n")
+
+    console.print("    [bold cyan]1.[/]  Configure Firefox → Tor SOCKS5 + disable DoH  [bold green](recommended)[/]")
+    console.print("    [bold cyan]2.[/]  Restore Firefox original settings")
+    console.print("    [bold cyan]3.[/]  Launch Firefox (Tor-routed)")
+    console.print("    [bold cyan]4.[/]  Launch Tor Browser")
+    console.print("    [bold cyan]5.[/]  Show Chromium Tor launch command")
+    console.print("    [bold cyan]0.[/]  Back\n")
+
+    choice = Prompt.ask("  Select", default="0")
+
+    if choice == "1":
+        browser.kill_firefox()
+        results = browser.configure_firefox(restore=False)
+        if results:
+            for profile, ok in results.items():
+                (print_ok if ok else print_fail)(f"{'Configured' if ok else 'Failed'}: {profile}")
+            print_info("Reopen Firefox — it will now use Tor SOCKS5 with no DoH")
+        else:
+            print_warn("No Firefox profiles found. Firefox may not be installed.")
+
+    elif choice == "2":
+        browser.kill_firefox()
+        results = browser.configure_firefox(restore=True)
+        if any(results.values()):
+            print_ok("Firefox settings restored")
+        else:
+            print_warn("No backup found — nothing to restore")
+
+    elif choice == "3":
+        ok = browser.launch_firefox_tor()
+        (print_ok if ok else print_fail)("Firefox launched" if ok else "Firefox not found")
+
+    elif choice == "4":
+        ok = browser.launch_tor_browser()
+        (print_ok if ok else print_fail)("Tor Browser launched" if ok else "Tor Browser not found — install it first")
+
+    elif choice == "5":
+        cmd = browser.get_chromium_command()
+        console.print(f"\n  [bold white]{cmd}[/]\n")
 
     console.print()
 
@@ -514,9 +561,10 @@ def main_menu():
         table.add_row("5", "DNS Manager",       "Configure anonymous DNS, disable IPv6")
         table.add_row("6", "Hostname Changer",  "Randomize system hostname")
         table.add_row("7", "Footprint Cleaner", "Wipe logs, history, temp files, browser data")
+        table.add_row("8", "Browser Config",    "Force Firefox through Tor SOCKS5, disable DoH")
         table.add_row("─", "─" * 30, "")
-        table.add_row("8", "Live Status",       "Fetch public IP and verify Tor exit")
-        table.add_row("9", "New Tor Identity",  "Request new Tor circuit (new exit node)")
+        table.add_row("9", "Live Status",       "Fetch public IP and verify Tor exit")
+        table.add_row("i", "New Tor Identity",  "Request new Tor circuit (new exit node)")
         table.add_row("0", "Exit", "")
 
         console.print(Align.center(table))
@@ -552,10 +600,14 @@ def main_menu():
             Prompt.ask("  [dim]Press Enter to continue[/]", default="")
         elif choice == "8":
             os.system("clear")
+            menu_browser()
+            Prompt.ask("  [dim]Press Enter to continue[/]", default="")
+        elif choice == "9":
+            os.system("clear")
             console.rule("[bold red]  LIVE STATUS CHECK", style="red")
             show_status(live_ip=True)
             Prompt.ask("  [dim]Press Enter to continue[/]", default="")
-        elif choice == "9":
+        elif choice == "i":
             ok, msg = tor_manager.new_tor_identity()
             (print_ok if ok else print_fail)(msg)
             Prompt.ask("  [dim]Press Enter to continue[/]", default="")
